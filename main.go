@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -100,9 +101,32 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 	log.Println(msg)
 }
 
+type Sortkey string
+
+const (
+	asc  Sortkey = "asc"
+	desc Sortkey = "desc"
+)
+
+func sortChirpsByAuthorID(sortKey Sortkey, chirps []database.Chirp) []database.Chirp {
+	if sortKey == asc {
+		sort.Slice(chirps, func(i, j int) bool {
+			return chirps[i].AuthorID < chirps[j].AuthorID
+		})
+		return chirps
+	}
+	sort.Slice(chirps, func(i, j int) bool { return chirps[i].AuthorID > chirps[j].AuthorID })
+	reversedChirps := make([]database.Chirp, 0, len(chirps))
+	for i := len(chirps) - 1; i >= 0; i-- {
+		reversedChirps = append(reversedChirps, chirps[i])
+	}
+	return reversedChirps
+}
+
 func main() {
 	godotenv.Load()
 	jwtSecret := os.Getenv("JWT_SECRET")
+	polkaAPiKey := os.Getenv("POLKA_API_KEY")
 	db, err := database.NewDB("database.json")
 	if err != nil {
 		log.Fatalf("Error preparing database: %s", err)
@@ -132,10 +156,40 @@ func main() {
 	})
 	apiMux.Post("/chirps", func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		tokenClaims := &jwt.RegisteredClaims{}
+		token, err := jwt.ParseWithClaims(
+			tokenString,
+			tokenClaims,
+			func(t *jwt.Token) (interface{}, error) { return []byte(jwtSecret), nil },
+		)
+		if err != nil {
+			respondWithError(w, 401, fmt.Sprintf("An error occured -> %s", err))
+			return
+		}
+		issuer, err := token.Claims.GetIssuer()
+		if err != nil {
+			respondWithError(w, 500, "Error getting token issuer")
+			return
+		}
+		if issuer != "chirpy-access" {
+			respondWithError(w, 401, "Access token required for this action, refresh token given")
+			return
+		}
+		ID, err := token.Claims.GetSubject()
+		if err != nil {
+			respondWithError(w, 500, "Error parsing user ID from JWT")
+			return
+		}
+		authorID, err := strconv.Atoi(ID)
+		if err != nil {
+			respondWithError(w, 500, "Error parsing user ID as int")
+			return
+		}
+
 		type reqBody struct {
 			Body string `json:"body"`
 		}
-
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			respondWithError(w, 500, "Error reading request body")
@@ -148,27 +202,59 @@ func main() {
 			return
 		}
 		if isValidChirp(chrp.Body) {
-			chirp, err := db.CreateChirp(cleanChirp(chrp.Body))
+			chirp, err := db.CreateChirp(cleanChirp(chrp.Body), authorID)
 			if err != nil {
 				respondWithError(w, 500, fmt.Sprintf("Something went wrong: %s", err))
 				return
 			}
 			respondWithJSON(w, 201, chirp)
-		} else {
-			respondWithError(w, 400, "Chirp is too long")
+			return
 		}
+		respondWithError(w, 400, "Chirp is too long")
 	})
 	apiMux.Get("/chirps", func(w http.ResponseWriter, r *http.Request) {
-		chirps, err := db.GetChirps()
+		authorIDAsString := r.URL.Query().Get("author_id")
+		value := r.URL.Query().Get("sort")
+		var sortKey Sortkey
+		if value == "" || !(value == "asc" || value == "desc") || value == "asc" {
+			sortKey = asc
+		} else {
+			sortKey = desc
+		}
+		if authorIDAsString == "" {
+			chirps, err := db.GetChirps()
+			if err != nil {
+				respondWithError(w, 500, fmt.Sprintf("Something went wrong: %s", err))
+				return
+			}
+			chirps = sortChirpsByAuthorID(sortKey, chirps)
+			respondWithJSON(w, 200, chirps)
+			return
+		}
+		authorID, err := strconv.Atoi(authorIDAsString)
 		if err != nil {
 			respondWithError(w, 500, fmt.Sprintf("Something went wrong: %s", err))
 			return
 		}
+		if authorID <= 0 {
+			respondWithError(w, 400, "Author ID must be greater than zero")
+			return
+		}
+		chirps, err := db.GetChirpsByAuthorID(authorID)
+		if err != nil {
+			respondWithError(w, 500, fmt.Sprintf("Something went wrong: %s", err))
+			return
+		}
+		chirps = sortChirpsByAuthorID(sortKey, chirps)
 		respondWithJSON(w, 200, chirps)
 	})
 	apiMux.Get("/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "chirpID")
 		chirpID, _ := strconv.Atoi(id)
+		if err != nil {
+			respondWithError(w, 500, "Error parsing chirp ID as int")
+			return
+		}
 		if chirpID <= 0 {
 			respondWithError(w, 400, "Chirp ID must be greater than zero")
 			return
@@ -184,6 +270,64 @@ func main() {
 		}
 		respondWithJSON(w, 200, chirp)
 	})
+	apiMux.Delete("/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		tokenClaims := &jwt.RegisteredClaims{}
+		token, err := jwt.ParseWithClaims(
+			tokenString,
+			tokenClaims,
+			func(t *jwt.Token) (interface{}, error) { return []byte(jwtSecret), nil },
+		)
+		if err != nil {
+			respondWithError(w, 401, fmt.Sprintf("An error occured -> %s", err))
+			return
+		}
+		issuer, err := token.Claims.GetIssuer()
+		if err != nil {
+			respondWithError(w, 500, "Error getting token issuer")
+			return
+		}
+		if issuer != "chirpy-access" {
+			respondWithError(w, 401, "Access token required for this action, refresh token given")
+			return
+		}
+		ID, err := token.Claims.GetSubject()
+		if err != nil {
+			respondWithError(w, 500, "Error parsing user ID from JWT")
+			return
+		}
+		authorID, err := strconv.Atoi(ID)
+		if err != nil {
+			respondWithError(w, 500, "Error parsing user ID as int")
+			return
+		}
+		chirpIDAsString := chi.URLParam(r, "chirpID")
+		chirpID, err := strconv.Atoi(chirpIDAsString)
+		if err != nil {
+			respondWithError(w, 500, "Error parsing chirp ID as int")
+			return
+		}
+		if chirpID <= 0 {
+			respondWithError(w, 500, "Chirp ID must be greater than zero")
+			return
+		}
+		chirp, err := db.GetChirp(chirpID)
+		if err != nil {
+			respondWithError(w, 500, fmt.Sprintf("Something went wrong -> %s", err))
+			return
+		}
+		if chirp.AuthorID != authorID {
+			respondWithError(w, 403, "Forbidden action. User did not create this chirp")
+			return
+		}
+		err = db.DeleteChirp(chirpID)
+		if err != nil {
+			respondWithError(w, 500, fmt.Sprintf("Something went wrong -> %s", err))
+			return
+		}
+		respondWithJSON(w, 200, fmt.Sprintf("Successfully deleted chirp with ID %d", chirpID))
+	})
+
 	apiMux.Post("/users", func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		type reqBody struct {
@@ -214,17 +358,17 @@ func main() {
 			return
 		}
 		type respBody struct {
-			ID    int    `json:"id"`
-			Email string `json:"email"`
+			ID          int    `json:"id"`
+			Email       string `json:"email"`
+			IsChirpyRed bool   `json:"is_chirpy_red"`
 		}
-		respondWithJSON(w, 201, respBody{ID: user.ID, Email: user.Email})
+		respondWithJSON(w, 201, respBody{ID: user.ID, Email: user.Email, IsChirpyRed: user.IsChirpyRed})
 	})
 	apiMux.Post("/login", func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		type reqBody struct {
-			Email            string `json:"email"`
-			Password         string `json:"password"`
-			ExpiresInSeconds int    `json:"expires_in_seconds"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -246,29 +390,29 @@ func main() {
 			respondWithError(w, 404, "User not found")
 			return
 		}
-		var expiresInSeconds int
-		secondsInADay := 86400
-		if userBody.ExpiresInSeconds == 0 || userBody.ExpiresInSeconds > secondsInADay {
-			expiresInSeconds = secondsInADay
-		} else if userBody.ExpiresInSeconds > 0 {
-			expiresInSeconds = userBody.ExpiresInSeconds
-		}
 		currentTimeInUTC := time.Now().UTC()
-		expirationAsDuration, err := time.ParseDuration(fmt.Sprintf("%ds", expiresInSeconds))
-		if err != nil {
-			respondWithError(w, 500, "Error parsing expiration time as time.Duration")
-			return
-		}
-		claims := &jwt.RegisteredClaims{
-			Issuer:    "chirpy",
+		accessClaims := &jwt.RegisteredClaims{
+			Issuer:    "chirpy-access",
 			IssuedAt:  jwt.NewNumericDate(currentTimeInUTC),
-			ExpiresAt: jwt.NewNumericDate(currentTimeInUTC.Add(expirationAsDuration)),
+			ExpiresAt: jwt.NewNumericDate(currentTimeInUTC.Add(1 * time.Hour)),
 			Subject:   fmt.Sprint(user.ID),
 		}
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-		signedToken, err := token.SignedString([]byte(jwtSecret))
+		accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
+		signedAcessToken, err := accessToken.SignedString([]byte(jwtSecret))
 		if err != nil {
-			respondWithError(w, 500, "Error creating signed JWT")
+			respondWithError(w, 500, "Error creating signed access JWT")
+			return
+		}
+		refreshClaims := &jwt.RegisteredClaims{
+			Issuer:    "chirpy-refresh",
+			IssuedAt:  jwt.NewNumericDate(currentTimeInUTC),
+			ExpiresAt: jwt.NewNumericDate(currentTimeInUTC.Add(1440 * time.Hour)),
+			Subject:   fmt.Sprint(user.ID),
+		}
+		refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
+		signedRefreshToken, err := refreshToken.SignedString([]byte(jwtSecret))
+		if err != nil {
+			respondWithError(w, 500, "Error creating signed refresh JWT")
 			return
 		}
 		err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(userBody.Password))
@@ -277,25 +421,39 @@ func main() {
 			return
 		}
 		type respBody struct {
-			ID    int    `json:"id"`
-			Email string `json:"email"`
-			Token string `json:"token"`
+			ID           int    `json:"id"`
+			Email        string `json:"email"`
+			IsChirpyRed  bool   `json:"is_chirpy_red"`
+			Token        string `json:"token"`
+			RefreshToken string `json:"refresh_token"`
 		}
-		respondWithJSON(w, 200, respBody{ID: user.ID, Email: user.Email, Token: signedToken})
+		respondWithJSON(w, 200, respBody{
+			ID:           user.ID,
+			Email:        user.Email,
+			IsChirpyRed:  user.IsChirpyRed,
+			Token:        signedAcessToken,
+			RefreshToken: signedRefreshToken})
 	})
 	apiMux.Put("/users", func(w http.ResponseWriter, r *http.Request) {
 		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		log.Printf("Recieved JWT: %s", tokenString)
 		tokenClaims := jwt.RegisteredClaims{}
 		token, err := jwt.ParseWithClaims(
 			tokenString,
 			&tokenClaims,
 			func(t *jwt.Token) (interface{}, error) { return []byte(jwtSecret), nil })
 		if err != nil {
-			respondWithError(w, 401, fmt.Sprintf("Error parsing JWT object from token string -> %s", err))
+			respondWithError(w, 401, fmt.Sprintf("An error occured -> %s", err))
 			return
 		}
-
+		issuer, err := token.Claims.GetIssuer()
+		if err != nil {
+			respondWithError(w, 500, "Error getting token issuer")
+			return
+		}
+		if issuer != "chirpy-access" {
+			respondWithError(w, 401, "Access token required for this action, refresh token given")
+			return
+		}
 		defer r.Body.Close()
 		type reqBody struct {
 			Email    string `json:"email"`
@@ -337,10 +495,129 @@ func main() {
 			return
 		}
 		type respBody struct {
-			ID    int    `json:"id"`
-			Email string `json:"email"`
+			ID          int    `json:"id"`
+			Email       string `json:"email"`
+			IsChirpyRed bool   `json:"is_chirpy_red"`
 		}
-		respondWithJSON(w, 200, respBody{ID: user.ID, Email: user.Email})
+		respondWithJSON(w, 200, respBody{ID: user.ID, Email: user.Email, IsChirpyRed: user.IsChirpyRed})
+	})
+	apiMux.Post("/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "ApiKey ")
+		if apiKey == "" || apiKey != polkaAPiKey {
+			respondWithError(w, 401, "")
+			return
+		}
+		defer r.Body.Close()
+		type reqBody struct {
+			Event string `json:"event"`
+			Data  struct {
+				UserID int `json:"user_id"`
+			} `json:"data"`
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			respondWithError(w, 500, "Error reading request body")
+			return
+		}
+		userBody := reqBody{}
+		err = json.Unmarshal(body, &userBody)
+		if err != nil {
+			respondWithError(w, 500, "Error unmarshaling JSON")
+			return
+		}
+		if userBody.Event != "user.upgraded" {
+			respondWithJSON(w, 200, "")
+			return
+		}
+		ok, err := db.UpgradeUser(userBody.Data.UserID)
+		if err != nil {
+			respondWithError(w, 500, fmt.Sprintf("Something went wrong -> %s", err))
+			return
+		}
+		if !ok {
+			respondWithError(w, 404, "User not found")
+			return
+		}
+		respondWithJSON(w, 200, "")
+	})
+	apiMux.Post("/refresh", func(w http.ResponseWriter, r *http.Request) {
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		tokenClaims := jwt.RegisteredClaims{}
+		token, err := jwt.ParseWithClaims(
+			tokenString,
+			&tokenClaims,
+			func(t *jwt.Token) (interface{}, error) { return []byte(jwtSecret), nil })
+		if err != nil {
+			respondWithError(w, 401, fmt.Sprintf("An error occured -> %s", err))
+			return
+		}
+		issuer, err := token.Claims.GetIssuer()
+		if err != nil {
+			respondWithError(w, 500, "Error getting token issuer")
+			return
+		}
+		if issuer != "chirpy-refresh" {
+			respondWithError(w, 401, "Refresh token required for this action, access token given")
+			return
+		}
+		userID, err := token.Claims.GetSubject()
+		if err != nil {
+			respondWithError(w, 500, "Error parsing user ID from token")
+			return
+		}
+		isRevoked, err := db.IsRevokedRefreshToken(tokenString)
+		if err != nil {
+			respondWithError(w, 500, fmt.Sprintf("Something went wrong: %s", err))
+			return
+		}
+		if isRevoked {
+			respondWithError(w, 401, "Action denied, refresh token is revoked")
+			return
+		}
+		currentTimeInUTC := time.Now().UTC()
+		accessClaims := &jwt.RegisteredClaims{
+			Issuer:    "chirpy-access",
+			IssuedAt:  jwt.NewNumericDate(currentTimeInUTC),
+			ExpiresAt: jwt.NewNumericDate(currentTimeInUTC.Add(1 * time.Hour)),
+			Subject:   userID,
+		}
+		accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
+		signedAcessToken, err := accessToken.SignedString([]byte(jwtSecret))
+		if err != nil {
+			respondWithError(w, 500, "Error creating signed access JWT")
+			return
+		}
+		type respBody struct {
+			Token string `json:"token"`
+		}
+		respondWithJSON(w, 200, respBody{Token: signedAcessToken})
+	})
+	apiMux.Post("/revoke", func(w http.ResponseWriter, r *http.Request) {
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		tokenClaims := jwt.RegisteredClaims{}
+		token, err := jwt.ParseWithClaims(
+			tokenString,
+			&tokenClaims,
+			func(t *jwt.Token) (interface{}, error) { return []byte(jwtSecret), nil })
+		if err != nil {
+			respondWithError(w, 401, fmt.Sprintf("An error occured -> %s", err))
+			return
+		}
+		issuer, err := token.Claims.GetIssuer()
+		if err != nil {
+			respondWithError(w, 500, "Error getting token issuer")
+			return
+		}
+		if issuer != "chirpy-refresh" {
+			respondWithError(w, 401, "Refresh token required for this action, access token given")
+			return
+		}
+		err = db.AddRevokedRefreshToken(tokenString)
+		if err != nil {
+			respondWithError(w, 500, fmt.Sprintf("Something went wrong: %s", err))
+			return
+		}
+		w.WriteHeader(200)
 	})
 
 	mux.Mount("/api/", apiMux)

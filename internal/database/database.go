@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+	"time"
 )
 
 type DB struct {
@@ -12,19 +13,27 @@ type DB struct {
 }
 
 type DBStructure struct {
-	Chirps map[int]Chirp `json:"chirps"`
-	Users  map[int]User  `json:"users"`
+	Chirps               map[int]Chirp              `json:"chirps"`
+	Users                map[int]User               `json:"users"`
+	RevokedRefreshTokens map[string]RevokedRfhToken `json:"revoked_refresh_tokens"`
 }
 
 type User struct {
-	ID       int    `json:"id"`
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	ID          int    `json:"id"`
+	Email       string `json:"email"`
+	Password    string `json:"password"`
+	IsChirpyRed bool   `json:"is_chirpy_red"`
 }
 
 type Chirp struct {
-	ID   int    `json:"id"`
-	Body string `json:"body"`
+	ID       int    `json:"id"`
+	Body     string `json:"body"`
+	AuthorID int    `json:"author_id"`
+}
+
+type RevokedRfhToken struct {
+	TokenString string    `json:"token_string"`
+	RevocalTime time.Time `json:"revocal_time"`
 }
 
 func (db *DB) ensureDB() error {
@@ -36,8 +45,9 @@ func (db *DB) ensureDB() error {
 		return nil
 	}
 	data, err := json.Marshal(DBStructure{
-		Chirps: make(map[int]Chirp),
-		Users:  make(map[int]User),
+		Chirps:               make(map[int]Chirp),
+		Users:                make(map[int]User),
+		RevokedRefreshTokens: make(map[string]RevokedRfhToken),
 	})
 	if err != nil {
 		return err
@@ -98,6 +108,21 @@ func (db *DB) GetChirps() ([]Chirp, error) {
 	return chirps, nil
 }
 
+func (db *DB) GetChirpsByAuthorID(authorID int) ([]Chirp, error) {
+	// GetChirpsByAuthorID returns all the chirps with the given authoor ID from the database
+	dbStruct, err := db.loadDB()
+	if err != nil {
+		return nil, err
+	}
+	chirpsByAuthor := []Chirp{}
+	for _, chirp := range dbStruct.Chirps {
+		if chirp.AuthorID == authorID {
+			chirpsByAuthor = append(chirpsByAuthor, chirp)
+		}
+	}
+	return chirpsByAuthor, nil
+}
+
 func (db *DB) GetChirp(id int) (Chirp, error) {
 	// GetChirp returns the chirp with `id` from the database if it exists
 	dbStruct, err := db.loadDB()
@@ -111,7 +136,7 @@ func (db *DB) GetChirp(id int) (Chirp, error) {
 	return chirp, nil
 }
 
-func (db *DB) CreateChirp(body string) (Chirp, error) {
+func (db *DB) CreateChirp(body string, authorID int) (Chirp, error) {
 	// CreateChirp creates a new chirp and saves it to disk
 	dbStruct, err := db.loadDB()
 	if err != nil {
@@ -119,8 +144,9 @@ func (db *DB) CreateChirp(body string) (Chirp, error) {
 	}
 	chirpID := len(dbStruct.Chirps) + 1
 	chirp := Chirp{
-		ID:   chirpID,
-		Body: body,
+		ID:       chirpID,
+		Body:     body,
+		AuthorID: authorID,
 	}
 	dbStruct.Chirps[chirpID] = chirp
 	err = db.writeDB(dbStruct)
@@ -128,6 +154,20 @@ func (db *DB) CreateChirp(body string) (Chirp, error) {
 		return Chirp{}, err
 	}
 	return chirp, nil
+}
+
+func (db *DB) DeleteChirp(id int) error {
+	// DeleteChirp deletes the chirp with the specified from disk, if it exists
+	dbStruct, err := db.loadDB()
+	if err != nil {
+		return err
+	}
+	delete(dbStruct.Chirps, id)
+	err = db.writeDB(dbStruct)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (db *DB) CreateUser(email, password string) (User, error) {
@@ -190,6 +230,59 @@ func (db *DB) UpdateUser(id int, email, password string) (User, error) {
 	return userData, nil
 }
 
+func (db *DB) UpgradeUser(userID int) (bool, error) {
+	// UpgradeUser changes the isChirpyRed field of the user with `userID` to true
+	// and persists changes to disk
+	dbStruct, err := db.loadDB()
+	if err != nil {
+		return false, err
+	}
+	user, ok := dbStruct.Users[userID]
+	if !ok {
+		return false, nil
+	}
+	user.IsChirpyRed = true
+	dbStruct.Users[userID] = user
+	err = db.writeDB(dbStruct)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (db *DB) IsRevokedRefreshToken(tokenString string) (bool, error) {
+	// IsRevokedRefreshToken checks if a refresh token is on disk. If it is, it has been revoked.
+	dbStruct, err := db.loadDB()
+	if err != nil {
+		return false, err
+	}
+	_, ok := dbStruct.RevokedRefreshTokens[tokenString]
+	return ok, nil
+}
+
+func (db *DB) AddRevokedRefreshToken(tokenString string) error {
+	// AddRevokedRefreshToken revokes a refresh token by saving it to disk. If the token is already saved
+	// to disk (revoked), it returns
+	dbStruct, err := db.loadDB()
+	if err != nil {
+		return err
+	}
+	_, ok := dbStruct.RevokedRefreshTokens[tokenString]
+	if ok {
+		return nil
+	}
+	revokedToken := RevokedRfhToken{
+		TokenString: tokenString,
+		RevocalTime: time.Now().UTC(),
+	}
+	dbStruct.RevokedRefreshTokens[tokenString] = revokedToken
+	err = db.writeDB(dbStruct)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func NewDB(path string) (*DB, error) {
 	/* NewDB creates a new database connection
 	   and creates the database file if it doesn't exist*/
@@ -202,8 +295,9 @@ func NewDB(path string) (*DB, error) {
 		return &db, nil
 	}
 	data, err := json.Marshal(DBStructure{
-		Chirps: make(map[int]Chirp),
-		Users:  make(map[int]User),
+		Chirps:               make(map[int]Chirp),
+		Users:                make(map[int]User),
+		RevokedRefreshTokens: make(map[string]RevokedRfhToken),
 	})
 	if err != nil {
 		return nil, err
